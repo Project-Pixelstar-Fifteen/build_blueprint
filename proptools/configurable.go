@@ -468,6 +468,12 @@ func NewConfigurable[T ConfigurableElements](conditions []ConfigurableCondition,
 	}
 }
 
+func NewSimpleConfigurable[T ConfigurableElements](value T) Configurable[T] {
+	return NewConfigurable(nil, []ConfigurableCase[T]{
+		NewConfigurableCase(nil, &value),
+	})
+}
+
 func newConfigurableWithPropertyName[T ConfigurableElements](propertyName string, conditions []ConfigurableCondition, cases []ConfigurableCase[T], addScope bool) Configurable[T] {
 	result := NewConfigurable(conditions, cases)
 	result.propertyName = propertyName

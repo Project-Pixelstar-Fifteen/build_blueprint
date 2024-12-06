@@ -42,7 +42,8 @@ type Args struct {
 	TraceFile  string
 
 	// Debug data json file
-	ModuleDebugFile string
+	ModuleDebugFile         string
+	IncrementalBuildActions bool
 }
 
 // RegisterGoModuleTypes adds module types to build tools written in golang
@@ -50,6 +51,14 @@ func RegisterGoModuleTypes(ctx *blueprint.Context) {
 	ctx.RegisterModuleType("bootstrap_go_package", newGoPackageModuleFactory())
 	ctx.RegisterModuleType("blueprint_go_binary", newGoBinaryModuleFactory())
 }
+
+// GoModuleTypesAreWrapped is called by Soong before calling RunBlueprint to provide its own wrapped
+// implementations of bootstrap_go_package and blueprint_go_bianry.
+func GoModuleTypesAreWrapped() {
+	goModuleTypesAreWrapped = true
+}
+
+var goModuleTypesAreWrapped = false
 
 // RunBlueprint emits `args.OutFile` (a Ninja file) and returns the list of
 // its dependencies. These can be written to a `${args.OutFile}.d` file
@@ -99,9 +108,11 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	}
 	ctx.EndEvent("list_modules")
 
-	ctx.RegisterBottomUpMutator("bootstrap_plugin_deps", pluginDeps)
+	ctx.RegisterBottomUpMutator("bootstrap_deps", BootstrapDeps)
 	ctx.RegisterSingletonType("bootstrap", newSingletonFactory(), false)
-	RegisterGoModuleTypes(ctx)
+	if !goModuleTypesAreWrapped {
+		RegisterGoModuleTypes(ctx)
+	}
 
 	ctx.BeginEvent("parse_bp")
 	if blueprintFiles, errs := ctx.ParseFileList(".", filesToParse, config); len(errs) > 0 {
@@ -123,6 +134,14 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 
 	if ctx.BeforePrepareBuildActionsHook != nil {
 		if err := ctx.BeforePrepareBuildActionsHook(); err != nil {
+			return nil, fatalErrors([]error{err})
+		}
+	}
+
+	if ctx.GetIncrementalAnalysis() {
+		var err error = nil
+		err = ctx.RestoreAllBuildActions(config.(BootstrapConfig).SoongOutDir())
+		if err != nil {
 			return nil, fatalErrors([]error{err})
 		}
 	}
@@ -184,6 +203,13 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	if f != nil {
 		if err := f.Close(); err != nil {
 			return nil, fmt.Errorf("error closing Ninja file: %s", err)
+		}
+	}
+
+	// TODO(b/357140398): parallelize this with other ninja file writing work.
+	if ctx.GetIncrementalEnabled() {
+		if err := ctx.CacheAllBuildActions(config.(BootstrapConfig).SoongOutDir()); err != nil {
+			return nil, fmt.Errorf("error cache build actions: %s", err)
 		}
 	}
 

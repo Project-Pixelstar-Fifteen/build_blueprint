@@ -87,6 +87,7 @@ const testTransitionBp = `
 
 			transition_module {
 				name: "F",
+				incoming: "",
 			}
 
 			transition_module {
@@ -112,7 +113,7 @@ func checkTransitionVariants(t *testing.T, ctx *Context, name string, expectedVa
 	group := ctx.moduleGroupFromName(name, nil)
 	var gotVariants []string
 	for _, variant := range group.modules {
-		gotVariants = append(gotVariants, variant.moduleOrAliasVariant().variations["transition"])
+		gotVariants = append(gotVariants, variant.moduleOrAliasVariant().variations.get("transition"))
 	}
 	if !slices.Equal(expectedVariants, gotVariants) {
 		t.Errorf("expected variants of %q to be %q, got %q", name, expectedVariants, gotVariants)
@@ -233,7 +234,7 @@ func TestPostTransitionDeps(t *testing.T) {
 	//  C(c) was added by C and rewritten by OutgoingTransition on B
 	//  D(d) was added by D:late and rewritten by IncomingTransition on D
 	//  E(d) was added by E:d
-	//  F() was added by F, and ignored the existing variation on B
+	//  F() was added by F and rewritten OutgoingTransition on B and then IncomingTransition on F
 	checkTransitionDeps(t, ctx, B_a, "C(c)", "C(c)", "D(d)", "E(d)", "F()")
 	checkTransitionDeps(t, ctx, B_b, "C(c)", "C(c)", "D(d)", "E(d)", "F()")
 	checkTransitionDeps(t, ctx, C_a, "D(d)")
@@ -259,6 +260,30 @@ func TestPostTransitionDeps(t *testing.T) {
 	checkTransitionMutate(t, H_h, "h")
 }
 
+func TestPostTransitionReverseDeps(t *testing.T) {
+	ctx, errs := testTransition(`
+		transition_module {
+			name: "A",
+			split: ["a1", "a2"],
+		}
+
+		transition_module {
+			name: "B",
+			split: ["a1", "a2"],
+			post_transition_reverse_deps: ["A"],
+		}
+	`)
+	assertNoErrors(t, errs)
+
+	checkTransitionVariants(t, ctx, "A", []string{"a1", "a2"})
+	checkTransitionVariants(t, ctx, "B", []string{"a1", "a2"})
+
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "A", "a1"), "B(a1)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "A", "a2"), "B(a2)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "B", "a1"))
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "B", "a2"))
+}
+
 func TestPostTransitionDepsMissingVariant(t *testing.T) {
 	// TODO: eventually this will create the missing variant on demand
 	_, errs := testTransition(fmt.Sprintf(testTransitionBp,
@@ -266,11 +291,42 @@ func TestPostTransitionDepsMissingVariant(t *testing.T) {
 	expectedError := `Android.bp:8:4: dependency "E" of "B" missing variant:
   transition:missing
 available variants:
-  transition:
+  <empty variant>
   transition:d`
 	if len(errs) != 1 || errs[0].Error() != expectedError {
 		t.Errorf("expected error %q, got %q", expectedError, errs)
 	}
+}
+
+func TestIsAddingDependency(t *testing.T) {
+	ctx, errs := testTransition(`
+		transition_module {
+			name: "A",
+			split: ["a1"],
+			deps: ["C"],
+		}
+
+		transition_module {
+			name: "B",
+			split: ["b1"],
+			post_transition_deps: ["C"],
+		}
+
+		transition_module {
+			name: "C",
+			split: ["c1", "c2"],
+			incoming: "c1",
+			post_transition_incoming: "c2",
+		}
+	`)
+	assertNoErrors(t, errs)
+
+	checkTransitionVariants(t, ctx, "A", []string{"a1"})
+	checkTransitionVariants(t, ctx, "B", []string{"b1"})
+	checkTransitionVariants(t, ctx, "C", []string{"c1", "c2"})
+
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "A", "a1"), "C(c1)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "B", "b1"), "C(c2)")
 }
 
 type transitionTestMutator struct{}
@@ -290,6 +346,12 @@ func (transitionTestMutator) OutgoingTransition(ctx OutgoingTransitionContext, s
 }
 
 func (transitionTestMutator) IncomingTransition(ctx IncomingTransitionContext, incomingVariation string) string {
+
+	if ctx.IsAddingDependency() {
+		if incoming := ctx.Module().(*transitionModule).properties.Post_transition_incoming; incoming != nil {
+			return *incoming
+		}
+	}
 	if incoming := ctx.Module().(*transitionModule).properties.Incoming; incoming != nil {
 		return *incoming
 	}
@@ -303,11 +365,13 @@ func (transitionTestMutator) Mutate(ctx BottomUpMutatorContext, variation string
 type transitionModule struct {
 	SimpleName
 	properties struct {
-		Deps                 []string
-		Post_transition_deps []string
-		Split                []string
-		Outgoing             *string
-		Incoming             *string
+		Deps                         []string
+		Post_transition_deps         []string
+		Post_transition_reverse_deps []string
+		Split                        []string
+		Outgoing                     *string
+		Incoming                     *string
+		Post_transition_incoming     *string
 
 		Mutated string `blueprint:"mutated"`
 	}
@@ -338,6 +402,9 @@ func postTransitionDepsMutator(mctx BottomUpMutatorContext) {
 				variations = append(variations, Variation{"transition", variation})
 			}
 			mctx.AddVariationDependencies(variations, walkerDepsTag{follow: true}, module)
+		}
+		for _, dep := range m.properties.Post_transition_reverse_deps {
+			mctx.AddReverseDependency(m, walkerDepsTag{follow: true}, dep)
 		}
 	}
 }

@@ -198,7 +198,7 @@ func TestAliasVariation(t *testing.T) {
 		ctx.RegisterBottomUpMutator("2", noAliasMutator("bar"))
 		ctx.RegisterBottomUpMutator("3", addVariantDepsMutator(nil, nil, "foo", "bar"))
 
-		runWithFailures(ctx, `dependency "bar" of "foo" missing variant:`+"\n  \n"+
+		runWithFailures(ctx, `dependency "bar" of "foo" missing variant:`+"\n  <empty variant>\n"+
 			"available variants:"+
 			"\n  1:a,2:a\n  1:a,2:b\n  1:b,2:a\n  1:b,2:b")
 	})

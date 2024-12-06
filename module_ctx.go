@@ -191,6 +191,7 @@ type EarlyModuleContext interface {
 	AddNinjaFileDeps(deps ...string)
 
 	moduleInfo() *moduleInfo
+
 	error(err error)
 
 	// Namespace returns the Namespace object provided by the NameInterface set by Context.SetNameInterface, or the
@@ -359,6 +360,10 @@ type BaseModuleContext interface {
 	// This method shouldn't be used directly, prefer the type-safe android.SetProvider instead.
 	SetProvider(provider AnyProviderKey, value any)
 
+	// HasMutatorFinished returns true if the given mutator has finished running.
+	// It will panic if given an invalid mutator name.
+	HasMutatorFinished(mutatorName string) bool
+
 	EarlyGetMissingDependencies() []string
 
 	base() *baseModuleContext
@@ -372,6 +377,8 @@ type ModuleContext interface {
 	// ModuleSubDir returns a unique name for the current variant of a module that can be used as part of the path
 	// to ensure that each variant of a module gets its own intermediates directory to write to.
 	ModuleSubDir() string
+
+	ModuleCacheKey() string
 
 	// Variable creates a new ninja variable scoped to the module.  It can be referenced by calls to Rule and Build
 	// in the same module.
@@ -491,6 +498,10 @@ func (d *baseModuleContext) Namespace() Namespace {
 	return d.context.nameInterface.GetNamespace(newNamespaceContext(d.module))
 }
 
+func (d *baseModuleContext) HasMutatorFinished(mutatorName string) bool {
+	return d.context.HasMutatorFinished(mutatorName)
+}
+
 var _ ModuleContext = (*moduleContext)(nil)
 
 type moduleContext struct {
@@ -535,8 +546,12 @@ func (m *baseModuleContext) OtherModuleErrorf(logicModule Module, format string,
 
 func (m *baseModuleContext) OtherModuleDependencyTag(logicModule Module) DependencyTag {
 	// fast path for calling OtherModuleDependencyTag from inside VisitDirectDeps
-	if logicModule == m.visitingDep.module.logicModule {
+	if m.visitingDep.module != nil && logicModule == m.visitingDep.module.logicModule {
 		return m.visitingDep.tag
+	}
+
+	if m.visitingParent == nil {
+		return nil
 	}
 
 	for _, dep := range m.visitingParent.directDeps {
@@ -608,6 +623,86 @@ func (m *baseModuleContext) Provider(provider AnyProviderKey) (any, bool) {
 
 func (m *baseModuleContext) SetProvider(provider AnyProviderKey, value interface{}) {
 	m.context.setProvider(m.module, provider.provider(), value)
+}
+
+func (m *moduleContext) cacheModuleBuildActions(key *BuildActionCacheKey) {
+	var providers []CachedProvider
+	for i, p := range m.module.providers {
+		if p != nil && providerRegistry[i].mutator == "" {
+			providers = append(providers,
+				CachedProvider{
+					Id:    providerRegistry[i],
+					Value: &p,
+				})
+		}
+	}
+
+	// These show up in the ninja file, so we need to cache these to ensure we
+	// re-generate ninja file if they changed.
+	relPos := m.module.pos
+	relPos.Filename = m.module.relBlueprintsFile
+	data := BuildActionCachedData{
+		Providers: providers,
+		Pos:       &relPos,
+	}
+
+	m.context.updateBuildActionsCache(key, &data)
+}
+
+func (m *moduleContext) restoreModuleBuildActions() (bool, *BuildActionCacheKey) {
+	// Whether the incremental flag is set and the module type supports
+	// incremental, this will decide weather to cache the data for the module.
+	incrementalEnabled := false
+	// Whether the above conditions are true and we can try to restore from
+	// the cache for this module, i.e., no env, product variables and Soong
+	// code changes.
+	incrementalAnalysis := false
+	var cacheKey *BuildActionCacheKey = nil
+	if m.context.GetIncrementalEnabled() {
+		if im, ok := m.module.logicModule.(Incremental); ok {
+			incrementalEnabled = im.IncrementalSupported()
+			incrementalAnalysis = m.context.GetIncrementalAnalysis() && incrementalEnabled
+		}
+	}
+	if incrementalEnabled {
+		hash, err := proptools.CalculateHash(m.module.properties)
+		if err != nil {
+			panic(newPanicErrorf(err, "failed to calculate properties hash"))
+		}
+		cacheInput := new(BuildActionCacheInput)
+		cacheInput.PropertiesHash = hash
+		m.VisitDirectDeps(func(module Module) {
+			cacheInput.ProvidersHash =
+				append(cacheInput.ProvidersHash, m.context.moduleInfo[module].providerInitialValueHashes)
+		})
+		hash, err = proptools.CalculateHash(&cacheInput)
+		if err != nil {
+			panic(newPanicErrorf(err, "failed to calculate cache input hash"))
+		}
+		cacheKey = &BuildActionCacheKey{
+			Id:        m.ModuleCacheKey(),
+			InputHash: hash,
+		}
+		m.module.buildActionCacheKey = cacheKey
+	}
+
+	restored := false
+	if incrementalAnalysis && cacheKey != nil {
+		// Try to restore from cache if there is a cache hit
+		data := m.context.getBuildActionsFromCache(cacheKey)
+		relPos := m.module.pos
+		relPos.Filename = m.module.relBlueprintsFile
+		if data != nil && data.Pos != nil && relPos == *data.Pos {
+			for _, provider := range data.Providers {
+				m.context.setProvider(m.module, provider.Id, *provider.Value)
+			}
+			m.module.incrementalRestored = true
+			m.module.orderOnlyStrings = data.OrderOnlyStrings
+			restored = true
+		}
+	}
+
+	return restored, cacheKey
 }
 
 func (m *baseModuleContext) GetDirectDep(name string) (Module, DependencyTag) {
@@ -761,6 +856,10 @@ func (m *moduleContext) ModuleSubDir() string {
 	return m.module.variant.name
 }
 
+func (m *moduleContext) ModuleCacheKey() string {
+	return m.module.ModuleCacheKey()
+}
+
 func (m *moduleContext) Variable(pctx PackageContext, name, value string) {
 	m.scope.ReparentTo(pctx)
 
@@ -832,14 +931,14 @@ type BaseMutatorContext interface {
 
 	// MutatorName returns the name that this mutator was registered with.
 	MutatorName() string
-}
-
-type TopDownMutatorContext interface {
-	BaseMutatorContext
 
 	// CreateModule creates a new module by calling the factory method for the specified moduleType, and applies
 	// the specified property structs to it as if the properties were set in a blueprint file.
 	CreateModule(ModuleFactory, string, ...interface{}) Module
+}
+
+type TopDownMutatorContext interface {
+	BaseMutatorContext
 }
 
 type BottomUpMutatorContext interface {
@@ -1049,7 +1148,7 @@ func (mctx *mutatorContext) AliasVariation(variationName string) {
 	}
 
 	for _, variant := range mctx.newVariations {
-		if variant.moduleOrAliasVariant().variations[mctx.mutator.name] == variationName {
+		if variant.moduleOrAliasVariant().variations.get(mctx.mutator.name) == variationName {
 			alias := &moduleAlias{
 				variant: mctx.module.variant,
 				target:  variant.moduleOrAliasTarget(),
@@ -1063,7 +1162,7 @@ func (mctx *mutatorContext) AliasVariation(variationName string) {
 
 	var foundVariations []string
 	for _, variant := range mctx.newVariations {
-		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations[mctx.mutator.name])
+		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations.get(mctx.mutator.name))
 	}
 	panic(fmt.Errorf("no %q variation in module variations %q", variationName, foundVariations))
 }
@@ -1082,7 +1181,7 @@ func (mctx *mutatorContext) CreateAliasVariation(aliasVariationName, targetVaria
 	}
 
 	for _, variant := range mctx.newVariations {
-		if variant.moduleOrAliasVariant().variations[mctx.mutator.name] == targetVariationName {
+		if variant.moduleOrAliasVariant().variations.get(mctx.mutator.name) == targetVariationName {
 			// Append the alias here so that it comes after any aliases created by AliasVariation.
 			mctx.module.splitModules = append(mctx.module.splitModules, &moduleAlias{
 				variant: newVariant,
@@ -1094,7 +1193,7 @@ func (mctx *mutatorContext) CreateAliasVariation(aliasVariationName, targetVaria
 
 	var foundVariations []string
 	for _, variant := range mctx.newVariations {
-		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations[mctx.mutator.name])
+		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations.get(mctx.mutator.name))
 	}
 	panic(fmt.Errorf("no %q variation in module variations %q", targetVariationName, foundVariations))
 }
